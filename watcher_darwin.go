@@ -127,6 +127,8 @@ func doInitFSEvents() error {
 // inside the callback to match events without holding the watcher lock.
 type fseReg struct {
 	path      string
+	key       string
+	keyLen    int
 	op        Op
 	recursive bool
 	isDir     bool
@@ -136,9 +138,18 @@ type fseReg struct {
 type fsStream struct {
 	stream    uintptr // FSEventStreamRef
 	path      string
+	key       string
+	keyLen    int
 	op        Op
 	recursive bool
 	isDir     bool
+}
+
+type rawFSEvent struct {
+	path  string
+	flags uint32
+	reg   fseReg
+	ok    bool
 }
 
 // Watcher monitors registered paths via macOS FSEvents.
@@ -295,6 +306,9 @@ func (w *Watcher) add(path string, op Op, recursive bool) error {
 	if _, exists := w.streams[key]; exists {
 		return ErrAlreadyAdded
 	}
+	if hasRecursiveRegistrationOverlapLocked(w.streams, key, recursive) {
+		return ErrAlreadyAdded
+	}
 
 	stream, err := w.createStreamLocked(abs)
 	if err != nil {
@@ -303,11 +317,25 @@ func (w *Watcher) add(path string, op Op, recursive bool) error {
 	w.streams[key] = &fsStream{
 		stream:    stream,
 		path:      abs,
+		key:       key,
+		keyLen:    len(key),
 		op:        op,
 		recursive: recursive,
 		isDir:     isDir,
 	}
 	return nil
+}
+
+func hasRecursiveRegistrationOverlapLocked(streams map[string]*fsStream, key string, recursive bool) bool {
+	for existingKey, fs := range streams {
+		if fs.recursive && isUnderOrSame(key, existingKey) {
+			return true
+		}
+		if recursive && isUnderOrSame(existingKey, key) {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *Watcher) createStreamLocked(path string) (uintptr, error) {
@@ -419,8 +447,16 @@ func handleFSEventsCallback(clientInfo uintptr, n int, pathsPtr, flagsPtr unsafe
 	closed := w.closed
 	regs := make([]fseReg, 0, len(w.streams))
 	for _, fs := range w.streams {
+		key := fs.key
+		keyLen := fs.keyLen
+		if key == "" {
+			key = pathKey(fs.path)
+			keyLen = len(key)
+		}
 		regs = append(regs, fseReg{
 			path:      fs.path,
+			key:       key,
+			keyLen:    keyLen,
 			op:        fs.op,
 			recursive: fs.recursive,
 			isDir:     fs.isDir,
@@ -432,6 +468,7 @@ func handleFSEventsCallback(clientInfo uintptr, n int, pathsPtr, flagsPtr unsafe
 	}
 
 	ptrSize := unsafe.Sizeof(uintptr(0))
+	batch := make([]rawFSEvent, 0, n)
 
 	for i := range n {
 		// Read char* from the paths array (char**) without uintptr→unsafe.Pointer.
@@ -448,52 +485,139 @@ func handleFSEventsCallback(clientInfo uintptr, n int, pathsPtr, flagsPtr unsafe
 		}
 
 		r, ok := matchRegistration(p, regs)
-		if !ok {
+		batch = append(batch, rawFSEvent{
+			path:  p,
+			flags: f,
+			reg:   r,
+			ok:    ok,
+		})
+	}
+
+	for i := 0; i < len(batch); i++ {
+		ev := batch[i]
+		if !ev.ok {
 			continue
 		}
 
 		// Handle RootChanged before the depth filter since RootChanged
 		// events always target the watched root itself (p == r.path).
-		if f&fseRootChanged != 0 {
-			w.mu.Lock()
-			if !w.closed {
-				key := pathKey(r.path)
-				if fs, exists := w.streams[key]; exists {
-					delete(w.streams, key)
-					w.cleanupW.Go(func() {
-						stopStream(fs.stream)
-					})
-				}
-			}
-			w.mu.Unlock()
-
-			op := fseventFlagsToOp(f) & r.op
-			if op == 0 {
-				op = (Rename | Remove) & r.op
-			}
-			if op != 0 {
-				w.sendEvent(Event{Name: r.path, Op: op})
-			}
+		if ev.flags&fseRootChanged != 0 {
+			w.handleRootChanged(ev.reg, ev.flags)
 			continue
 		}
 
-		// Suppress events for the watched root directory — its metadata
-		// changes are noise. File watches must not be suppressed.
-		if r.isDir && p == r.path {
+		if !deliverableFSEvent(ev) {
 			continue
 		}
-		if !r.recursive {
-			rel, err := filepath.Rel(r.path, p)
-			if err != nil || strings.ContainsRune(rel, filepath.Separator) {
-				continue
-			}
+
+		if i+1 < len(batch) && canPairRenameEvents(ev, batch[i+1]) {
+			w.sendRenamePair(ev, batch[i+1])
+			i++
+			continue
 		}
 
-		op := fseventFlagsToOp(f) & r.op
+		op := fseventFlagsToOp(ev.flags) & ev.reg.op
 		if op == 0 {
 			continue
 		}
-		w.sendEvent(Event{Name: p, Op: op})
+		w.sendEvent(Event{Name: ev.path, Op: op})
+	}
+}
+
+func (w *Watcher) handleRootChanged(r fseReg, flags uint32) {
+	key := r.key
+	if key == "" {
+		key = pathKey(r.path)
+	}
+	w.mu.Lock()
+	if !w.closed {
+		if fs, exists := w.streams[key]; exists {
+			delete(w.streams, key)
+			w.cleanupW.Go(func() {
+				stopStream(fs.stream)
+			})
+		}
+	}
+	w.mu.Unlock()
+
+	op := fseventFlagsToOp(flags) & r.op
+	if op == 0 {
+		op = (Rename | Remove) & r.op
+	}
+	if op != 0 {
+		w.sendEvent(Event{Name: r.path, Op: op})
+	}
+}
+
+func deliverableFSEvent(ev rawFSEvent) bool {
+	r := ev.reg
+	regKey := r.key
+	if regKey == "" {
+		regKey = pathKey(r.path)
+	}
+	evKey := pathKey(ev.path)
+
+	// Suppress events for the watched root directory — its metadata
+	// changes are noise. File watches must not be suppressed.
+	if r.isDir && evKey == regKey {
+		return false
+	}
+	if !r.recursive {
+		return isDirectRegistrationChild(evKey, regKey)
+	}
+	return true
+}
+
+func isDirectRegistrationChild(childKey, parentKey string) bool {
+	if childKey == parentKey {
+		return true
+	}
+	sep := string(filepath.Separator)
+	if parentKey == sep {
+		rest := strings.TrimPrefix(childKey, sep)
+		return rest != "" && !strings.Contains(rest, sep)
+	}
+	prefix := parentKey + sep
+	if !strings.HasPrefix(childKey, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(childKey, prefix)
+	return rest != "" && !strings.Contains(rest, sep)
+}
+
+func canPairRenameEvents(old, new rawFSEvent) bool {
+	if !old.ok || !new.ok {
+		return false
+	}
+	if old.flags&fseItemRenamed == 0 {
+		return false
+	}
+	if new.flags&(fseItemRenamed|fseItemCreated) == 0 {
+		return false
+	}
+	if old.flags&fseRootChanged != 0 || new.flags&fseRootChanged != 0 {
+		return false
+	}
+	oldKey := old.reg.key
+	if oldKey == "" {
+		oldKey = pathKey(old.reg.path)
+	}
+	newKey := new.reg.key
+	if newKey == "" {
+		newKey = pathKey(new.reg.path)
+	}
+	if oldKey != newKey {
+		return false
+	}
+	return deliverableFSEvent(new)
+}
+
+func (w *Watcher) sendRenamePair(old, new rawFSEvent) {
+	if old.reg.op.Has(Rename) {
+		w.sendEvent(Event{Name: old.path, Op: Rename})
+	}
+	if new.reg.op.Has(Create) {
+		w.sendEvent(Event{Name: new.path, Op: Create})
 	}
 }
 
@@ -504,10 +628,19 @@ func matchRegistration(p string, regs []fseReg) (fseReg, bool) {
 	var best fseReg
 	found := false
 	for _, r := range regs {
-		rk := pathKey(r.path)
-		if pk == rk || isUnder(pk, rk) {
-			if !found || len(rk) > len(pathKey(best.path)) {
+		key := r.key
+		if key == "" {
+			key = pathKey(r.path)
+		}
+		keyLen := r.keyLen
+		if keyLen == 0 {
+			keyLen = len(key)
+		}
+		if pk == key || isUnder(pk, key) {
+			if !found || keyLen > best.keyLen {
 				best = r
+				best.key = key
+				best.keyLen = keyLen
 				found = true
 			}
 		}
@@ -516,10 +649,15 @@ func matchRegistration(p string, regs []fseReg) (fseReg, bool) {
 }
 
 func isUnder(child, parent string) bool {
-	if parent == "/" {
-		return true
+	sep := string(filepath.Separator)
+	if parent == sep {
+		return strings.HasPrefix(child, sep)
 	}
-	return strings.HasPrefix(child, parent+string(filepath.Separator))
+	return strings.HasPrefix(child, parent+sep)
+}
+
+func isUnderOrSame(child, parent string) bool {
+	return child == parent || isUnder(child, parent)
 }
 
 func (w *Watcher) sendEvent(e Event) {

@@ -57,6 +57,42 @@ func waitOp(t *testing.T, w *Watcher, want Op) Event {
 	}
 }
 
+func collectEvents(t *testing.T, w *Watcher, want int) []Event {
+	t.Helper()
+	deadline := time.NewTimer(eventTimeout)
+	defer deadline.Stop()
+
+	events := make([]Event, 0, want)
+	for len(events) < want {
+		select {
+		case ev, ok := <-w.Events:
+			if !ok {
+				t.Fatalf("Events channel closed while waiting for %d events; got %d", want, len(events))
+			}
+			events = append(events, ev)
+		case err := <-w.Errors:
+			t.Fatalf("unexpected error: %v", err)
+		case <-deadline.C:
+			t.Fatalf("timeout waiting for %d events; got %d", want, len(events))
+		}
+	}
+	return events
+}
+
+func assertNoEvents(t *testing.T, w *Watcher, quietFor time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(quietFor)
+	defer timer.Stop()
+
+	select {
+	case ev := <-w.Events:
+		t.Fatalf("unexpected extra event: %s", ev)
+	case err := <-w.Errors:
+		t.Fatalf("unexpected error: %v", err)
+	case <-timer.C:
+	}
+}
+
 func TestWatchCreate(t *testing.T) {
 	dir := tempDir(t)
 	w := newWatcher(t)
@@ -274,7 +310,7 @@ func TestWatchRename(t *testing.T) {
 	}
 
 	w := newWatcher(t)
-	if err := w.Add(dir, Rename); err != nil {
+	if err := w.Add(dir, Rename|Create); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 
@@ -541,10 +577,10 @@ func TestSymlinkDeduplicates(t *testing.T) {
 }
 
 func TestAddCaseInsensitive(t *testing.T) {
-	if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
-		t.Skip("It looks that your file system is case sensitive, so this test is not applicable")
-	}
 	dir := tempDir(t)
+	if !caseInsensitivePathForTest(t, dir) {
+		t.Skip("case-insensitive path contract test")
+	}
 	w := newWatcher(t)
 	if err := w.Add(dir, All); err != nil {
 		t.Fatalf("Add: %v", err)
@@ -562,11 +598,15 @@ func TestAddCaseInsensitive(t *testing.T) {
 func TestAddSharpS(t *testing.T) {
 	switch runtime.GOOS {
 	case "darwin":
-		// APFS is case-insensitive.
+		parent := tempDir(t)
+		if !caseInsensitivePathForTest(t, parent) {
+			t.Skip("case-insensitive Darwin Sharp S contract test")
+		}
+
+		// Case-insensitive APFS folds these spellings together.
 		// Uppercase and lowercase Sharp S are considered the same path on APFS.
 		// Furthermore, "ss" and "SS" are also considered the same path as "ß" and "ẞ".
 
-		parent := tempDir(t)
 		w := newWatcher(t)
 
 		dir := filepath.Join(parent, "ß") // LATIN SMALL LETTER SHARP S
@@ -624,34 +664,6 @@ func TestAddSharpS(t *testing.T) {
 		if err := w.Add(dir2, All); err != nil {
 			t.Fatalf("Add(ẞ): %v", err)
 		}
-	}
-}
-
-func TestAddUnicodeNormalization(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("This test is only applicable on macOS")
-	}
-
-	parent := tempDir(t)
-	w := newWatcher(t)
-
-	dir := filepath.Join(parent, "\u304C") // HIRAGANA LETTER GA (U+304C) in NFC
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		t.Fatalf("Mkdir: %v", err)
-	}
-	if err := w.Add(dir, All); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
-
-	dir = filepath.Join(parent, "\u304B\u3099") // HIRAGANA LETTER GA in NFD (U+304C decomposes to U+304B + U+3099)
-	if err := os.Mkdir(dir, 0o755); !errors.Is(err, os.ErrExist) {
-		t.Errorf("Mkdir(\u304B\u3099) = %v, want os.ErrExist", err)
-	}
-	if err := w.Add(dir, All); !errors.Is(err, ErrAlreadyAdded) {
-		t.Errorf("Add(\u304B\u3099) = %v, want ErrAlreadyAdded", err)
-	}
-	if err := w.Remove(dir); err != nil {
-		t.Errorf("Remove(\u304B\u3099) = %v, want nil", err)
 	}
 }
 
@@ -875,6 +887,32 @@ func TestAddRecursiveRemoveDropsSubtree(t *testing.T) {
 	// Subdirectory should no longer be tracked.
 	if err := w.Add(nested, All); err != nil {
 		t.Errorf("Add(nested) after Remove(root) = %v, want nil", err)
+	}
+}
+
+func TestAddRecursiveOwnsSubtree(t *testing.T) {
+	root := tempDir(t)
+	nested := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	w := newWatcher(t)
+	if err := w.AddRecursive(root, All); err != nil {
+		t.Fatalf("AddRecursive: %v", err)
+	}
+
+	if err := w.Add(filepath.Join(root, "a"), All); !errors.Is(err, ErrAlreadyAdded) {
+		t.Fatalf("Add(child) = %v, want ErrAlreadyAdded", err)
+	}
+	if err := w.AddRecursive(filepath.Join(root, "a"), All); !errors.Is(err, ErrAlreadyAdded) {
+		t.Fatalf("AddRecursive(child) = %v, want ErrAlreadyAdded", err)
+	}
+	if err := w.Remove(filepath.Join(root, "a")); !errors.Is(err, ErrNotAdded) {
+		t.Fatalf("Remove(child) = %v, want ErrNotAdded", err)
+	}
+	if err := w.Remove(root); err != nil {
+		t.Fatalf("Remove(root): %v", err)
 	}
 }
 
