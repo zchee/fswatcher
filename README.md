@@ -56,7 +56,12 @@ func main() {
 - `(*Watcher).Events <-chan Event` — receives change notifications.
 - `(*Watcher).Errors <-chan error` — receives non-fatal errors.
 
-Paths are canonicalized (absolute, cleaned, with symlinks resolved when the target exists; on Windows 8.3 short forms are expanded and case is folded), so two spellings of the same path dedupe and `Event.Name` is always returned in canonical form.
+Paths are canonicalized (absolute, cleaned, with symlinks resolved when the
+target exists; on Windows 8.3 short forms are expanded and case is folded), so
+two spellings of the same path dedupe and `Event.Name` is always returned in
+canonical form. On macOS, registration keys follow the watched volume's
+path-identity policy instead of assuming every volume has the same case or
+Unicode-normalization behavior.
 
 ## Events
 
@@ -84,6 +89,28 @@ Paths are canonicalized (absolute, cleaned, with symlinks resolved when the targ
 | Windows | ReadDirectoryChangesW   | Supported |
 | macOS   | FSEvents (purego)       | Supported |
 | FreeBSD | kqueue                  | Supported |
+
+### macOS notes
+
+The macOS backend uses FSEvents through
+[`purego`](https://github.com/ebitengine/purego), so applications do not need
+cgo to use it. Recursive watches use native FSEvents recursion instead of
+opening one file descriptor per descendant, while non-recursive directory
+watches filter child events before they reach `Events`.
+
+If macOS reports that events may have been dropped, the watcher sends a
+non-fatal error on `Errors`; callers should rescan or reconcile the affected
+tree. When a watched root is removed or renamed, the watcher drops that
+registration and emits the requested `Remove` and/or `Rename` event bits when
+the platform reports enough information to do so.
+
+Path matching on macOS follows the watched volume's identity policy: case and
+Unicode-normalization folding are used on case-insensitive volumes, and the
+backend falls back to conservative case-sensitive matching when the volume
+policy cannot be determined.
+If a recursive root and a more-specific registration both cover an event path,
+the more-specific registration handles the event so each watch's operation mask
+remains meaningful.
 
 ## License
 
