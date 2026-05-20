@@ -878,6 +878,32 @@ func TestAddRecursiveRemoveDropsSubtree(t *testing.T) {
 	}
 }
 
+func TestAddRecursiveOverlapPrefersNestedRegistration(t *testing.T) {
+	root := tempDir(t)
+	nested := filepath.Join(root, "nested")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+
+	w := newWatcher(t)
+	if err := w.AddRecursive(root, Write); err != nil {
+		t.Fatalf("AddRecursive(root): %v", err)
+	}
+	if err := w.Add(nested, Create); err != nil {
+		t.Fatalf("Add(nested): %v", err)
+	}
+
+	target := filepath.Join(nested, "child.txt")
+	if err := os.WriteFile(target, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	ev := waitOp(t, w, Create)
+	if ev.Name != target {
+		t.Errorf("Name = %q, want %q", ev.Name, target)
+	}
+}
+
 func TestConcurrentAddDistinct(t *testing.T) {
 	w := newWatcher(t)
 	const n = 16
